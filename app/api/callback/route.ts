@@ -6,6 +6,9 @@ import { supabaseAdmin } from "@/lib/supabase/admin";
 import { GUEST_MODE } from "@/lib/guestMode";
 import * as guestDb from "@/lib/guest/db";
 
+// Mirroring a video to R2 can take a while; keep the function alive for it.
+export const maxDuration = 300;
+
 function extractUrls(resultJson?: string): string[] {
   if (!resultJson) return [];
   try {
@@ -24,6 +27,32 @@ function settle(taskId: string, result: Parameters<typeof jobStore.set>[1]) {
   jobEvents.emit(`job:${taskId}`, result);
 }
 
+async function markError(taskId: string, error: string) {
+  settle(taskId, { status: "error", error });
+  if (GUEST_MODE) {
+    guestDb.updateGeneration(taskId, { status: "error", error_msg: error });
+    return;
+  }
+  const { error: e } = await supabaseAdmin
+    .from("generations")
+    .update({ status: "error", error_msg: error })
+    .eq("task_id", taskId);
+  if (e) console.error("[callback] supabase error update failed:", e.message);
+}
+
+async function getGenerationType(taskId: string): Promise<"image" | "video" | null> {
+  if (GUEST_MODE) return null;
+  const { data } = await supabaseAdmin
+    .from("generations")
+    .select("generation_type")
+    .eq("task_id", taskId)
+    .single();
+  return (data?.generation_type as "image" | "video" | undefined) ?? null;
+}
+
+// IMPORTANT: on serverless the function is frozen as soon as it returns a
+// response, so every async side-effect here must be awaited before returning —
+// no fire-and-forget .then() chains.
 export async function POST(req: NextRequest) {
   const body = await req.json();
   console.log("[callback] received:", JSON.stringify(body, null, 2));
@@ -39,23 +68,11 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ received: true });
   }
 
-  // Treat a non-200 top-level code as a hard error (e.g. Veo 500 responses that
-  // carry no state/status field but do carry body.code and body.msg).
+  // Non-200 top-level code = hard error (e.g. Veo 500 responses with no state).
   if (body.code !== undefined && body.code !== 200) {
     const error = data.failMsg ?? body.msg ?? "Generation failed";
     console.log("[callback] top-level error code:", body.code, error);
-    settle(taskId, { status: "error", error });
-    if (GUEST_MODE) {
-      guestDb.updateGeneration(taskId, { status: "error", error_msg: error });
-    } else {
-      supabaseAdmin
-        .from("generations")
-        .update({ status: "error", error_msg: error })
-        .eq("task_id", taskId)
-        .then(({ error: e }) => {
-          if (e) console.error("[callback] supabase error update failed:", e.message);
-        });
-    }
+    await markError(taskId, error);
     return NextResponse.json({ received: true });
   }
 
@@ -67,86 +84,55 @@ export async function POST(req: NextRequest) {
     if (kieUrls.length === 0 && (data.output?.[0] ?? data.output)) {
       kieUrls.push(data.output?.[0] ?? data.output);
     }
-    if (kieUrls.length > 0) {
-      // The in-memory jobStore is not shared across serverless instances, so the
-      // callback can't use it to tell image from video. Read the persisted
-      // generations row instead; fall back to jobStore for guest mode.
-      let genType: "image" | "video" | null = null;
-      if (!GUEST_MODE) {
-        const { data: genRow } = await supabaseAdmin
-          .from("generations")
-          .select("generation_type")
-          .eq("task_id", taskId)
-          .single();
-        genType = (genRow?.generation_type as "image" | "video" | undefined) ?? null;
-      }
-      const existing = jobStore.get(taskId);
-      const isVideo  = genType
-        ? genType === "video"
-        : existing?.status === "pending" && (existing as { type?: string }).type === "video";
-      const folder   = isVideo ? "videos" : "images";
 
-      Promise.all(kieUrls.map((u) => mirrorToR2(u, folder)))
-        .then((storedUrls) => {
-          if (isVideo) {
-            const result = { status: "done" as const, videoUrl: storedUrls[0] };
-            settle(taskId, result);
-            if (GUEST_MODE) {
-              guestDb.updateGeneration(taskId, { status: "done", video_url: storedUrls[0] });
-            } else {
-              return supabaseAdmin.from("generations").update({ status: "done", video_url: storedUrls[0] }).eq("task_id", taskId);
-            }
-          } else {
-            const result = { status: "done" as const, imageUrl: storedUrls[0], imageUrls: storedUrls };
-            settle(taskId, result);
-            if (GUEST_MODE) {
-              guestDb.updateGeneration(taskId, { status: "done", image_url: storedUrls[0], image_urls: storedUrls });
-            } else {
-              return supabaseAdmin.from("generations").update({ status: "done", image_url: storedUrls[0], image_urls: storedUrls }).eq("task_id", taskId);
-            }
-          }
-        })
-        .then((supabaseResult: { error: { message: string } | null } | undefined) => {
-          if (supabaseResult?.error) console.error("[callback] supabase update error:", supabaseResult.error.message);
-        })
-        .catch((err) => {
-          console.error("[callback] storage upload failed, using source URLs:", err.message);
-          if (isVideo) {
-            const result = { status: "done" as const, videoUrl: kieUrls[0] };
-            settle(taskId, result);
-            if (GUEST_MODE) {
-              guestDb.updateGeneration(taskId, { status: "done", video_url: kieUrls[0] });
-            } else {
-              supabaseAdmin.from("generations").update({ status: "done", video_url: kieUrls[0] }).eq("task_id", taskId).then(() => {});
-            }
-          } else {
-            const result = { status: "done" as const, imageUrl: kieUrls[0], imageUrls: kieUrls };
-            settle(taskId, result);
-            if (GUEST_MODE) {
-              guestDb.updateGeneration(taskId, { status: "done", image_url: kieUrls[0], image_urls: kieUrls });
-            } else {
-              supabaseAdmin.from("generations").update({ status: "done", image_url: kieUrls[0], image_urls: kieUrls }).eq("task_id", taskId).then(() => {});
-            }
-          }
-        });
-    } else {
+    if (kieUrls.length === 0) {
       console.log("[callback] success but no URL found in resultJson");
+      return NextResponse.json({ received: true });
+    }
+
+    // The in-memory jobStore is not shared across serverless instances, so tell
+    // image from video via the persisted row (jobStore is the guest-mode path).
+    const genType  = await getGenerationType(taskId);
+    const existing = jobStore.get(taskId);
+    const isVideo  = genType
+      ? genType === "video"
+      : existing?.status === "pending" && (existing as { type?: string }).type === "video";
+    const folder   = isVideo ? "videos" : "images";
+
+    // Try to mirror to R2; fall back to the source URLs if that fails.
+    let storedUrls = kieUrls;
+    try {
+      storedUrls = await Promise.all(kieUrls.map((u) => mirrorToR2(u, folder)));
+    } catch (err) {
+      console.error("[callback] storage upload failed, using source URLs:", (err as Error).message);
+    }
+
+    if (isVideo) {
+      settle(taskId, { status: "done", videoUrl: storedUrls[0] });
+      if (GUEST_MODE) {
+        guestDb.updateGeneration(taskId, { status: "done", video_url: storedUrls[0] });
+      } else {
+        const { error: e } = await supabaseAdmin
+          .from("generations")
+          .update({ status: "done", video_url: storedUrls[0] })
+          .eq("task_id", taskId);
+        if (e) console.error("[callback] supabase update error:", e.message);
+      }
+    } else {
+      settle(taskId, { status: "done", imageUrl: storedUrls[0], imageUrls: storedUrls });
+      if (GUEST_MODE) {
+        guestDb.updateGeneration(taskId, { status: "done", image_url: storedUrls[0], image_urls: storedUrls });
+      } else {
+        const { error: e } = await supabaseAdmin
+          .from("generations")
+          .update({ status: "done", image_url: storedUrls[0], image_urls: storedUrls })
+          .eq("task_id", taskId);
+        if (e) console.error("[callback] supabase update error:", e.message);
+      }
     }
   } else if (state === "fail" || state === "failed" || state === "error") {
     const error = data.failMsg ?? data.error ?? body.msg ?? "Generation failed";
-    settle(taskId, { status: "error", error });
-
-    if (GUEST_MODE) {
-      guestDb.updateGeneration(taskId, { status: "error", error_msg: error });
-    } else {
-      supabaseAdmin
-        .from("generations")
-        .update({ status: "error", error_msg: error })
-        .eq("task_id", taskId)
-        .then(({ error: e }) => {
-          if (e) console.error("[callback] supabase error update failed:", e.message);
-        });
-    }
+    await markError(taskId, error);
   } else {
     console.log("[callback] intermediate state, ignoring:", state);
   }

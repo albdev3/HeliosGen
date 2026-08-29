@@ -418,7 +418,9 @@ export async function POST(req: NextRequest) {
       reference_image_urls: referenceUrls,
     });
   } else {
-    supabaseAdmin.from("generations").insert({
+    // Must be awaited: on serverless the function is frozen once it returns, so
+    // a fire-and-forget insert may never run (row missing -> "Job not found").
+    const { error: insertErr } = await supabaseAdmin.from("generations").insert({
       task_id:              taskId,
       user_id:              userId,
       generation_type:      "video",
@@ -430,9 +432,8 @@ export async function POST(req: NextRequest) {
       kling_mode:           mode,
       sound:                cfg.sound ? Boolean(sound) : false,
       reference_image_urls: referenceUrls,
-    }).then(({ error }) => {
-      if (error) console.error("[generate-video] supabase insert error:", error.message);
     });
+    if (insertErr) console.error("[generate-video] supabase insert error:", insertErr.message);
   }
 
   return NextResponse.json({ taskId });

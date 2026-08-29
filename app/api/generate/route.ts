@@ -570,7 +570,9 @@ export async function POST(req: NextRequest) {
         reference_image_urls: r2ImageUrls,
       });
     } else {
-      supabaseAdmin.from("generations").insert({
+      // Must be awaited: on serverless the function is frozen once it returns, so
+      // a fire-and-forget insert may never run (row missing -> "Job not found").
+      const { error: insertErr } = await supabaseAdmin.from("generations").insert({
         task_id:              taskId,
         user_id:              currentUserId,
         generation_type:      "image",
@@ -580,9 +582,8 @@ export async function POST(req: NextRequest) {
         aspect_ratio:         aspectRatio,
         quality,
         reference_image_urls: r2ImageUrls,
-      }).then(({ error }) => {
-        if (error) console.error("[generate] supabase insert error:", error.message);
       });
+      if (insertErr) console.error("[generate] supabase insert error:", insertErr.message);
     }
 
     return NextResponse.json({ taskId, referenceImageUrls: r2ImageUrls });
