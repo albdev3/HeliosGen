@@ -476,17 +476,21 @@ export default function VideoGeneratorNode({ id, data, selected }: NodeProps<Vid
     return () => cancelAnimationFrame(raf);
   }, [id, videoModelId, veoMode, updateNodeInternals]);
 
-  // ── Wait for job completion via SSE (callback-driven, no polling) ─────────
+  // ── Wait for job completion via SSE, reconnecting across serverless cutoffs ──
   useEffect(() => {
     const taskId = data.taskId as string | undefined;
     if (!taskId || status !== "running") return;
 
-    const es = new EventSource(`/api/job-stream?taskId=${taskId}`);
+    let es: EventSource | null = null;
+    let stopped = false;
+    let errorStreak = 0;
+    const startedAt = Date.now();
+    const MAX_WAIT_MS = 15 * 60 * 1000;
 
-    es.onmessage = (event) => {
-      es.close();
-      let json: { status: string; videoUrl?: string; error?: string };
-      try { json = JSON.parse(event.data); } catch { return; }
+    const finish = (json: { status: string; videoUrl?: string; error?: string }) => {
+      if (stopped) return;
+      stopped = true;
+      es?.close();
 
       const storeNode = useWorkflowStore.getState().nodes.find((n) => n.id === id);
       const gens = [...((storeNode?.data?.generations as GenEntry[] | undefined) ?? [])] as GenEntry[];
@@ -502,9 +506,35 @@ export default function VideoGeneratorNode({ id, data, selected }: NodeProps<Vid
       }
     };
 
-    es.onerror = () => es.close();
+    const connect = () => {
+      if (stopped) return;
+      es = new EventSource(`/api/job-stream?taskId=${taskId}`);
 
-    return () => es.close();
+      es.onopen = () => { errorStreak = 0; };
+
+      es.onmessage = (event) => {
+        errorStreak = 0;
+        let json: { status: string; videoUrl?: string; error?: string };
+        try { json = JSON.parse(event.data); } catch { return; }
+        finish(json);
+      };
+
+      // Vercel terminates the SSE function at ~300s; reconnect and re-check the
+      // job until it resolves or we hit the wall-clock cap.
+      es.onerror = () => {
+        es?.close();
+        if (stopped) return;
+        errorStreak += 1;
+        if (Date.now() - startedAt > MAX_WAIT_MS || errorStreak > 40) {
+          finish({ status: "error", error: "Generation timed out" });
+          return;
+        }
+        setTimeout(connect, 3000);
+      };
+    };
+
+    connect();
+    return () => { stopped = true; es?.close(); };
   }, [data.taskId, status, id, updateNodeData]);
 
   const activeHandles = new Set<string>(cfg.handles);

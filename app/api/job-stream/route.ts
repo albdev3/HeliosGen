@@ -17,24 +17,28 @@ const SSE_HEADERS = {
 };
 
 const TIMEOUT_MS = 12 * 60 * 1000; // 12 min hard cap
-const POLL_MS = 3000; // fallback poll of Supabase (callback runs in a separate instance on serverless)
+const POLL_MS = 3000; // fallback poll of the DB (callback runs in a separate instance on serverless)
+
+// "pending" = the job row exists but hasn't completed; null = no row at all.
+type Recovered = JobResult | "pending" | null;
 
 function immediate(payload: JobResult): Response {
   return new Response(`data: ${JSON.stringify(payload)}\n\n`, { headers: SSE_HEADERS });
 }
 
-async function recoverJob(taskId: string): Promise<JobResult | null> {
+async function recoverJob(taskId: string): Promise<Recovered> {
   if (GUEST_MODE) {
     const gen = guestDb.recoverJob(taskId);
-    if (gen?.status === "done") {
+    if (!gen) return null;
+    if (gen.status === "done") {
       return gen.video_url
         ? { status: "done", videoUrl: gen.video_url }
         : { status: "done", imageUrl: gen.image_url ?? undefined, imageUrls: gen.image_urls ?? undefined };
     }
-    if (gen?.status === "error") {
+    if (gen.status === "error") {
       return { status: "error", error: gen.error_msg ?? "Generation failed" };
     }
-    return null;
+    return "pending";
   }
 
   const { data: gen } = await supabaseAdmin
@@ -43,38 +47,40 @@ async function recoverJob(taskId: string): Promise<JobResult | null> {
     .eq("task_id", taskId)
     .single();
 
-  if (gen?.status === "done") {
+  if (!gen) return null;
+  if (gen.status === "done") {
     return gen.video_url
       ? { status: "done", videoUrl: gen.video_url }
       : { status: "done", imageUrl: gen.image_url, imageUrls: gen.image_urls };
   }
-  if (gen?.status === "error") {
+  if (gen.status === "error") {
     return { status: "error", error: gen.error_msg ?? "Generation failed" };
   }
-  return null;
+  return "pending";
 }
 
 export async function GET(req: NextRequest) {
   const taskId = req.nextUrl.searchParams.get("taskId");
   if (!taskId) return new Response("taskId required", { status: 400 });
 
-  // Already settled in jobStore — respond immediately, no stream needed
+  // Already settled in jobStore — respond immediately, no stream needed.
   const existing = jobStore.get(taskId);
   if (existing && existing.status !== "pending") {
     return immediate(existing);
   }
 
-  if (!existing) {
-    const recovered = await recoverJob(taskId);
-    if (recovered) {
-      jobStore.set(taskId, recovered);
-      return immediate(recovered);
-    }
-    // Not in Supabase either — truly not found
+  // Check the DB. Azure jobs have no row and can't be recovered on a cold start.
+  const recovered = await recoverJob(taskId);
+  if (recovered && recovered !== "pending") {
+    jobStore.set(taskId, recovered);
+    return immediate(recovered);
+  }
+  if (recovered === null && !existing) {
     return immediate({ status: "error", error: "Job not found" });
   }
 
-  // Job is pending — open an SSE stream and wait for the callback to fire
+  // Job is pending (row present, or jobStore says pending) — open an SSE stream
+  // and wait for the callback to land / the DB row to flip.
   const stream = new ReadableStream({
     start(controller) {
       const enc = new TextEncoder();
@@ -100,18 +106,18 @@ export async function GET(req: NextRequest) {
         if (!closed) controller.enqueue(enc.encode(": ping\n\n"));
       }, 25_000);
 
-      // Hard cap — emit error if callback never arrives
+      // Hard cap — emit error if the callback never arrives
       const timeout = setTimeout(() => {
         send({ status: "error", error: "Generation timed out" });
       }, TIMEOUT_MS);
 
-      // Fallback: on serverless the callback route runs in a different instance,
-      // so jobEvents never fires here. Poll the DB (Supabase / guest) directly.
+      // On serverless the callback route runs in a different instance, so
+      // jobEvents never fires here — poll the DB directly.
       const poll = setInterval(async () => {
         if (closed) return;
         try {
-          const recovered = await recoverJob(taskId);
-          if (recovered) send(recovered);
+          const r = await recoverJob(taskId);
+          if (r && r !== "pending") send(r);
         } catch {
           /* transient — keep waiting */
         }
