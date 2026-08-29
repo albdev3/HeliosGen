@@ -26,6 +26,11 @@ export async function stripMetadata(buffer: Buffer, contentType: string): Promis
         "-y", outputPath,
       ]);
       return await readFile(outputPath);
+    } catch (err) {
+      // ffmpeg isn't available on some hosts (e.g. Vercel serverless). Don't let
+      // metadata stripping block storage — keep the original bytes.
+      console.warn("[media-metadata] video strip skipped:", (err as Error).message);
+      return buffer;
     } finally {
       await Promise.all([
         unlink(inputPath).catch(() => {}),
