@@ -68,8 +68,22 @@ export async function POST(req: NextRequest) {
       kieUrls.push(data.output?.[0] ?? data.output);
     }
     if (kieUrls.length > 0) {
+      // The in-memory jobStore is not shared across serverless instances, so the
+      // callback can't use it to tell image from video. Read the persisted
+      // generations row instead; fall back to jobStore for guest mode.
+      let genType: "image" | "video" | null = null;
+      if (!GUEST_MODE) {
+        const { data: genRow } = await supabaseAdmin
+          .from("generations")
+          .select("generation_type")
+          .eq("task_id", taskId)
+          .single();
+        genType = (genRow?.generation_type as "image" | "video" | undefined) ?? null;
+      }
       const existing = jobStore.get(taskId);
-      const isVideo  = existing?.status === "pending" && (existing as { type?: string }).type === "video";
+      const isVideo  = genType
+        ? genType === "video"
+        : existing?.status === "pending" && (existing as { type?: string }).type === "video";
       const folder   = isVideo ? "videos" : "images";
 
       Promise.all(kieUrls.map((u) => mirrorToR2(u, folder)))
