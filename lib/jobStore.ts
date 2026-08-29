@@ -1,30 +1,23 @@
-import { existsSync, readFileSync, writeFileSync } from "fs";
-import { join } from "path";
-
 export type JobResult =
   | { status: "pending"; type?: "image" | "video"; userId?: string }
   | { status: "done"; imageUrl?: string; imageUrls?: string[]; videoUrl?: string }
   | { status: "error"; error: string };
 
-const FILE = join(process.cwd(), ".job-store.json");
-
-function read(): Record<string, JobResult> {
-  if (!existsSync(FILE)) return {};
-  try { return JSON.parse(readFileSync(FILE, "utf8")); }
-  catch { return {}; }
-}
-
-function write(data: Record<string, JobResult>): void {
-  writeFileSync(FILE, JSON.stringify(data), "utf8");
-}
+// In-memory job cache.
+//
+// On serverless platforms (Vercel) the app directory is read-only and every
+// request runs in an isolated instance, so a file-backed store both crashes
+// (EROFS) and can't be shared between the generate / callback / job-status
+// routes anyway. The source of truth is the Supabase `generations` table; the
+// job-status and job-stream routes fall back to it via recoverJob(). This Map
+// is only a hot-path cache within a single warm instance.
+const store = new Map<string, JobResult>();
 
 export const jobStore = {
   get(taskId: string): JobResult | undefined {
-    return read()[taskId];
+    return store.get(taskId);
   },
   set(taskId: string, result: JobResult): void {
-    const data = read();
-    data[taskId] = result;
-    write(data);
+    store.set(taskId, result);
   },
 };

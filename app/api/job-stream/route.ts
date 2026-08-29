@@ -5,6 +5,11 @@ import { supabaseAdmin } from "@/lib/supabase/admin";
 import { GUEST_MODE } from "@/lib/guestMode";
 import * as guestDb from "@/lib/guest/db";
 
+// Give the stream the full serverless window (Vercel Hobby caps at 300s). On a
+// long-running Node server this is a no-op. When the platform kills the function
+// the browser's EventSource reconnects and the new invocation re-checks state.
+export const maxDuration = 300;
+
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
@@ -12,6 +17,7 @@ const SSE_HEADERS = {
 };
 
 const TIMEOUT_MS = 12 * 60 * 1000; // 12 min hard cap
+const POLL_MS = 3000; // fallback poll of Supabase (callback runs in a separate instance on serverless)
 
 function immediate(payload: JobResult): Response {
   return new Response(`data: ${JSON.stringify(payload)}\n\n`, { headers: SSE_HEADERS });
@@ -78,6 +84,7 @@ export async function GET(req: NextRequest) {
         if (closed) return;
         closed = true;
         clearInterval(heartbeat);
+        clearInterval(poll);
         clearTimeout(timeout);
         controller.close();
       };
@@ -97,6 +104,18 @@ export async function GET(req: NextRequest) {
       const timeout = setTimeout(() => {
         send({ status: "error", error: "Generation timed out" });
       }, TIMEOUT_MS);
+
+      // Fallback: on serverless the callback route runs in a different instance,
+      // so jobEvents never fires here. Poll the DB (Supabase / guest) directly.
+      const poll = setInterval(async () => {
+        if (closed) return;
+        try {
+          const recovered = await recoverJob(taskId);
+          if (recovered) send(recovered);
+        } catch {
+          /* transient — keep waiting */
+        }
+      }, POLL_MS);
 
       jobEvents.once(`job:${taskId}`, send);
 
