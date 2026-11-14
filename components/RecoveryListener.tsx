@@ -18,9 +18,13 @@ export default function RecoveryListener() {
     const params = new URLSearchParams(window.location.hash.slice(1));
     if (params.get("type") === "recovery") {
       setResetPasswordModalOpen(true);
-    } else if (params.get("error")) {
-      // Expired / already-used link: send the user back to "forgot password".
-      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    } else if (params.get("error") || new URLSearchParams(window.location.search).get("error_code")) {
+      // Expired / already-used link (error arrives in the hash for implicit
+      // flow, in the query string for PKCE): back to "forgot password".
+      const q = new URLSearchParams(window.location.search);
+      ["error", "error_code", "error_description"].forEach((k) => q.delete(k));
+      const qs = q.toString();
+      window.history.replaceState(null, "", window.location.pathname + (qs ? `?${qs}` : ""));
       addToast("Reset link expired or already used — please request a new one.", "info");
       setAuthModalView("forgot");
       setAuthModalOpen(true);
