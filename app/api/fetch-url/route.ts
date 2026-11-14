@@ -16,6 +16,9 @@ export const maxDuration = 60;
 const MAX_BYTES = 50 * 1024 * 1024; // 50 MB
 
 export async function POST(req: NextRequest) {
+  if (!(await resolveUserId(req))) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
   try {
     const { url } = await req.json() as { url?: string };
     if (!url || typeof url !== "string") {

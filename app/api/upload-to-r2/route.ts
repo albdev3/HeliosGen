@@ -11,6 +11,9 @@ import * as guestDb from "@/lib/guest/db";
  *   → returns { cdnUrl: string }
  */
 export async function POST(req: NextRequest) {
+  if (!(await resolveUserId(req))) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
   try {
     const { dataUrl, folder = "uploads", mimeType } = await req.json() as {
       dataUrl:   string;

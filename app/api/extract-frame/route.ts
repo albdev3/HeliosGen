@@ -6,6 +6,7 @@
  */
 import { NextRequest, NextResponse } from "next/server";
 import { uploadBuffer } from "@/lib/r2";
+import { resolveUserId } from "@/lib/guestMode";
 import { writeFile, readFile, unlink, mkdtemp } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -17,6 +18,9 @@ const execFileAsync = promisify(execFile);
 export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
+  if (!(await resolveUserId(req))) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
   let inputPath: string | null  = null;
   let outputPath: string | null = null;
 
